@@ -8,7 +8,7 @@ VibeCoding is a growing toolkit of “vibe‑coding” scripts and utilities—A
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/your‑org/vibecoding.git
+   git clone https://github.com/TristanMiano/vibecoding.git
    cd vibecoding
    ```
 2. Create a virtual environment and install dependencies:
