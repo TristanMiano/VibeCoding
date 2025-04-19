@@ -1,0 +1,5 @@
+tiktoken
+google-genai
+openai
+faiss-cpu
+numpy
