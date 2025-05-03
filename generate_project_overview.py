@@ -47,6 +47,8 @@ Everything in the following text and act as a helpful software engineering assis
 
 At the end of the overview, there will be a list of next steps for implementation. Please tailor your response for these steps. Generally, if more than one step is listed, focus on the first one only in your first response. The user will probably request the subsequent steps later.
 
+Do not add unnecessary complexity. Do not assume the user will infer the proper steps to take if you leave some out. Be very explicit. If you generate code, generate the entire file fully working. You may generate code snippets if the user asks for those. If you do, please explain exactly where to put them.
+
 If you can't find any next steps for the project listed at the bottom of the file, please do your best to look for mistakes, errors, discrepancies, or ways to clean up and refine the project, and decide yourself what should be considered high priority, and include that in your first response.
 
 --------------------------------------------------------------------------------
@@ -230,6 +232,7 @@ def main():
         f.write("\n".join(dirs))
         f.write("\n\n=== Consolidated Documentation ===\n")
         f.write("\n".join(contents))
+        f.write("\n\n--------------------------------------------------------------------------------")
     print(f"Written overview to {overview_path}")
 
     # write requirements into CWD
