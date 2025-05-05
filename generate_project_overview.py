@@ -7,7 +7,7 @@ Usage examples:
   # full overview, no skipping
   python generate_project_overview.py
 
-  # short mode: only signatures/docstrings in .py files
+  # short mode: only signatures/docstrings in supported languages
   python generate_project_overview.py --short
 
   # skip everything under data/ and build/, but re-include data/important/
@@ -20,10 +20,30 @@ Usage examples:
 
 import os
 import sys
-import ast
 import fnmatch
 import argparse
 from pathlib import Path
+
+from tree_sitter import Language, Parser
+from tree_sitter_language_pack import get_language, get_parser
+import ast  # still used for Python import parsing
+
+# Map file extensions to tree-sitter language names (must be compiled into the shared library)
+EXT_LANG_MAP = {
+    '.py': 'python',
+    '.js': 'javascript',
+    '.ts': 'typescript',
+    '.java': 'java',
+    '.c': 'c',
+    '.cpp': 'cpp',
+    '.go': 'go',
+    '.rb': 'ruby',
+    '.php': 'php',
+    '.swift': 'swift',
+    '.kt': 'kotlin',
+    '.scala': 'scala',
+    '.rs': 'rust',
+}
 
 # A naive list of known standard library modules we skip from "requirements".
 STANDARD_LIBS = {
@@ -56,47 +76,12 @@ If you can't find any next steps for the project listed at the bottom of the fil
 
 
 def is_text_file(file_path: Path) -> bool:
-    text_extensions = {
-        '.txt', '.md', '.rst', '.py', '.java', '.js', '.ts', '.cpp', '.c',
-        '.cs', '.html', '.css', '.xml', '.yaml', '.yml', '.sh', '.bat',
-        '.go', '.rb', '.php', '.swift', '.kt', '.scala', '.pl', '.sql'
-    }
+    text_extensions = set(EXT_LANG_MAP.keys()) | {'.txt', '.md', '.rst', '.html', '.css', '.xml', '.yaml', '.yml', '.sh', '.bat', '.sql'}
     return file_path.suffix.lower() in text_extensions
 
 
 def get_file_type(file_path: Path) -> str:
     return file_path.suffix.lower() if file_path.suffix else 'No Extension'
-
-
-def extract_functions_and_docstrings(file_content: str) -> str:
-    try:
-        tree = ast.parse(file_content)
-    except SyntaxError:
-        return ""
-    lines = []
-    module_doc = ast.get_docstring(tree)
-    if module_doc:
-        lines.append(f'Module Docstring:\n"""{module_doc}"""\n')
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef):
-            lines.append(f"def {node.name}(...):")
-            doc = ast.get_docstring(node)
-            if doc:
-                lines.append(f'    """{doc}"""')
-            lines.append("")
-        elif isinstance(node, ast.ClassDef):
-            lines.append(f"class {node.name}(...):")
-            doc = ast.get_docstring(node)
-            if doc:
-                lines.append(f'    """{doc}"""')
-            for sub in node.body:
-                if isinstance(sub, ast.FunctionDef):
-                    lines.append(f"    def {sub.name}(...):")
-                    mdoc = ast.get_docstring(sub)
-                    if mdoc:
-                        lines.append(f'        """{mdoc}"""')
-            lines.append("")
-    return "\n".join(lines)
 
 
 def parse_imports_from_python(file_content: str) -> set[str]:
@@ -116,6 +101,79 @@ def parse_imports_from_python(file_content: str) -> set[str]:
 
 def is_standard_library(module_name: str) -> bool:
     return module_name in STANDARD_LIBS
+
+
+def extract_tree_functions(file_bytes: bytes, ext: str, parsers: dict) -> str:
+    """
+    Parse the file bytes with tree-sitter and extract function/class definitions plus docstrings or preceding comments.
+    """
+    lang_name = EXT_LANG_MAP.get(ext)
+    parser = parsers.get(lang_name)
+    if not parser:
+        return ''
+    tree = parser.parse(file_bytes)
+    root = tree.root_node
+    lines: list[str] = []
+
+    # Module-level docstring or leading comments
+    if lang_name == 'python':
+        for child in root.children:
+            if child.type == 'expression_statement' and child.children and child.children[0].type == 'string':
+                module_doc = child.children[0].text.decode('utf-8')
+                lines.append(f'Module Docstring:\n{module_doc}\n')
+                break
+    else:
+        leading_comments = []
+        for child in root.children:
+            if child.type == 'comment':
+                leading_comments.append(child.text.decode('utf-8'))
+            else:
+                break
+        if leading_comments:
+            lines.append('Module Comments:')
+            lines += leading_comments
+            lines.append('')
+
+    # Recursive traversal
+    def traverse(node):
+        yield node
+        for c in node.children:
+            yield from traverse(c)
+
+    func_nodes = {'function_definition', 'function_declaration', 'method_definition', 'method_declaration', 'arrow_function', 'function'}
+    class_nodes = {'class_definition', 'class_declaration', 'struct_specifier'}
+
+    for node in traverse(root):
+        if node.type in func_nodes or node.type in class_nodes:
+            # Get name
+            name = '<anonymous>'
+            for c in node.children:
+                if c.type in ('identifier', 'name') or c.type.endswith('name'):
+                    name = c.text.decode('utf-8')
+                    break
+            kind = 'def' if node.type in func_nodes else 'class'
+            lines.append(f'{kind} {name}()')
+            # Extract doc
+            doc = None
+            if lang_name == 'python':
+                # look for first string literal in suite
+                for c in node.children:
+                    if c.type == 'suite':
+                        for stmt in c.children:
+                            if stmt.type == 'expression_statement' and stmt.children and stmt.children[0].type == 'string':
+                                doc = stmt.children[0].text.decode('utf-8')
+                                break
+                        break
+            else:
+                # find comment immediately preceding node
+                comments = [n for n in traverse(root) if n.type == 'comment' and n.end_byte < node.start_byte]
+                if comments:
+                    doc = comments[-1].text.decode('utf-8')
+            if doc:
+                for l in doc.splitlines():
+                    lines.append('    ' + l)
+            lines.append('')
+    return '\n'.join(lines)
 
 
 def is_excluded(
@@ -138,62 +196,52 @@ def traverse_directory(
     root_path: Path,
     short_version: bool = False,
     exclude_patterns: list[str] = None,
-    include_patterns: list[str] = None
+    include_patterns: list[str] = None,
+    parsers: dict = None
 ):
     exclude_patterns = exclude_patterns or []
     include_patterns = include_patterns or []
 
-    directory_structure = []
-    relevant_contents = []
-    third_party_libraries = set()
-
-    readme_exts = {'.md', '.markdown', '.txt'}
-    code_exts = {
-        '.py', '.java', '.js', '.ts', '.cpp', '.c', '.cs', '.html', '.css',
-        '.xml', '.yaml', '.yml', '.sh', '.bat', '.go', '.rb',
-        '.php', '.swift', '.kt', '.scala', '.pl', '.sql'
-    }
-    doc_exts = readme_exts | {'.rst'}
+    directory_structure: list[str] = []
+    relevant_contents: list[str] = []
+    third_party_libraries: set[str] = set()
 
     for dirpath, dirnames, filenames in os.walk(root_path):
-        # skip hidden dirs
         dirnames[:] = [d for d in dirnames if not d.startswith('.')]
-        rel_dir = Path(dirpath).relative_to(root_path).as_posix() or "."
-        # skip if entire dir excluded
+        rel_dir = Path(dirpath).relative_to(root_path).as_posix() or '.'
         if is_excluded(rel_dir, exclude_patterns, include_patterns):
             continue
-
-        directory_structure.append(f"Directory: {rel_dir}")
-
-        # prune dirnames by exclude/include
-        dirnames[:] = [
-            d for d in dirnames
-            if not is_excluded(f"{rel_dir}/{d}", exclude_patterns, include_patterns)
-        ]
-
+        directory_structure.append(f'Directory: {rel_dir}')
+        dirnames[:] = [d for d in dirnames if not is_excluded(f"{rel_dir}/{d}", exclude_patterns, include_patterns)]
         for fn in filenames:
-            if fn.startswith('.'): continue
-            rel_file = fn if rel_dir == "." else f"{rel_dir}/{fn}"
-            if is_excluded(rel_file, exclude_patterns, include_patterns): continue
+            if fn.startswith('.'):
+                continue
+            rel_file = fn if rel_dir == '.' else f"{rel_dir}/{fn}"
+            if is_excluded(rel_file, exclude_patterns, include_patterns):
+                continue
             p = Path(dirpath) / fn
-            directory_structure.append(f"  File: {fn} | Type: {get_file_type(p)}")
+            directory_structure.append(f'  File: {fn} | Type: {get_file_type(p)}')
 
             if is_text_file(p):
                 try:
-                    content = p.read_text(encoding='utf-8')
-                    if p.suffix == '.py':
-                        imports = parse_imports_from_python(content)
+                    ext = p.suffix.lower()
+                    # handle imports for Python
+                    if ext == '.py':
+                        content_py = p.read_text(encoding='utf-8')
+                        imports = parse_imports_from_python(content_py)
                         for lib in imports:
                             if not is_standard_library(lib):
                                 third_party_libraries.add(lib)
-                    if short_version and p.suffix == '.py':
-                        snippet = extract_functions_and_docstrings(content)
+                    # short mode: extract via tree-sitter if supported
+                    if short_version and ext in EXT_LANG_MAP:
+                        content_bytes = p.read_bytes()
+                        snippet = extract_tree_functions(content_bytes, ext, parsers)
                         relevant_contents.append(f"\n=== Functions & Docstrings in {rel_file} ===\n{snippet}")
                     else:
+                        content = p.read_text(encoding='utf-8')
                         relevant_contents.append(f"\n=== Content of {rel_file} ===\n{content}")
                 except Exception as e:
                     print(f"Warning: could not read {p}: {e}", file=sys.stderr)
-
     return directory_structure, relevant_contents, third_party_libraries
 
 
@@ -201,19 +249,28 @@ def main():
     parser = argparse.ArgumentParser(description="Generate a project overview.")
     parser.add_argument(
         "--short", action="store_true", default=False,
-        help="Only include function signatures & docstrings for .py files."
+        help="Only include function signatures & docstrings for supported languages."
     )
     parser.add_argument(
-        "-e", "--exclude", nargs="*", default=[],
-        help="Glob patterns of files/dirs to skip entirely."
+        "-e", "--exclude", nargs="*", default=[], help="Glob patterns of files/dirs to skip entirely."
     )
     parser.add_argument(
-        "-i", "--include", nargs="*", default=[],
-        help="Glob patterns to force-include (overrides exclude)."
+        "-i", "--include", nargs="*", default=[], help="Glob patterns to force-include (overrides exclude)."
     )
+    
     args = parser.parse_args()
 
-    # use working directory as root
+    # Initialize parsers for each language
+    # build a map of all the parsers you need
+    parsers: dict[str, any] = {}
+    for ext, lang_name in EXT_LANG_MAP.items():
+        try:
+            # get_parser() returns a Parser() already set up with that language
+            parsers[lang_name] = get_parser(lang_name)
+        except KeyError:
+            # language wasn’t included in the wheel (very rare)
+            pass
+
     root = Path.cwd().resolve()
     print(f"Traversing directory: {root}")
 
@@ -221,10 +278,10 @@ def main():
         root_path=root,
         short_version=args.short,
         exclude_patterns=args.exclude,
-        include_patterns=args.include
+        include_patterns=args.include,
+        parsers=parsers
     )
 
-    # write overview into CWD
     overview_path = root / "project_overview.txt"
     with overview_path.open('w', encoding='utf-8') as f:
         f.write(PROMPT_TEXT)
@@ -232,10 +289,9 @@ def main():
         f.write("\n".join(dirs))
         f.write("\n\n=== Consolidated Documentation ===\n")
         f.write("\n".join(contents))
-        f.write("\n\n--------------------------------------------------------------------------------")
+        f.write("\n\n" + "-"*80)
     print(f"Written overview to {overview_path}")
 
-    # write requirements into CWD
     req_path = root / "requirements_autogenerated.txt"
     with req_path.open('w', encoding='utf-8') as f:
         for lib in sorted(libs):
